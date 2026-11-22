@@ -1,0 +1,289 @@
+#!/bin/bash
+# autodesk-fusion - launcher for the Autodesk Fusion Flatpak.
+#
+# GE-Proton's Wine does everything here: it creates the prefix,
+# installs Fusion, and runs it, and it supplies the DXVK /
+# vkd3d-proton DLLs copied into the prefix. The community recipe
+# (cryinkfly) pairs Fusion with a custom "fusion-wine-build" for
+# the launch, but on the target machine that build crashes during
+# Fusion's window creation even with the full recipe applied,
+# while GE-Proton's Wine runs it - so this package deliberately
+# does not bundle the community build. (That build also cannot
+# create a working prefix: it does not register the standard
+# Windows services on wineboot, which breaks installers.)
+#
+# Setup order is the order verified end-to-end on the target
+# machine: the prefix gets the light components first and Fusion
+# is installed in that state. The remaining components from the
+# cryinkfly recipe (.NET, VC runtimes, WebView2, DLL overrides,
+# Windows 11 mode) are applied after the install, best-effort:
+# they serve Fusion at run time, so a failure there is logged but
+# does not block the launch, and the stage is retried on the next
+# launch until it completes once.
+#
+# Everything mutable lives under $XDG_DATA_HOME/autodesk-fusion, which
+# for this Flatpak is ~/.var/app/io.github.scottcrossen.AutodeskFusion/data,
+# so removing the app's data removes the whole installation.
+set -u
+
+GE_DIR=/app/ge-proton
+GE_PATH="$GE_DIR/files/bin:/app/bin:$PATH"
+GE_WINESERVER="$GE_DIR/files/bin/wineserver"
+export PATH="$GE_PATH"
+export WINESERVER="$GE_WINESERVER"
+
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/autodesk-fusion"
+PREFIX="$DATA/prefix"
+DOWNLOADS="$DATA/downloads"
+MARKER="$DATA/.fusion-installed"
+PFX_MARKER="$DATA/.prefix-v4-done"
+EXTRAS_MARKER="$DATA/.extras-v4-done"
+INSTALLER_URL="https://dl.appstreaming.autodesk.com/production/installers/Fusion%20Admin%20Install.exe"
+INSTALLER="$DOWNLOADS/Fusion Admin Install.exe"
+WEBVIEW2_URL="https://go.microsoft.com/fwlink/?linkid=2124701"
+WEBVIEW2="$DOWNLOADS/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+OPTIONS_XML=/app/share/autodesk-fusion/NMachineSpecificOptions.xml
+
+export WINEPREFIX="$PREFIX"
+export WINEARCH=win64
+export DXVK_LOG_LEVEL=none
+BASE_OVERRIDES="winemenubuilder.exe=d"
+
+log() { printf '[autodesk-fusion] %s\n' "$*"; }
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a "Autodesk Fusion" "Autodesk Fusion" "$1" || true
+  fi
+}
+die() { log "ERROR: $*"; notify "Setup failed: $*"; exit 1; }
+
+# Bounded wait for a prefix's wineserver: if the server does not exit
+# on its own, kill it (safe between steps; the next command starts a
+# fresh one). $1 = wineserver binary.
+ws_wait() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 20 "$1" -w 2>/dev/null || "$1" -k 2>/dev/null || true
+  else
+    "$1" -w 2>/dev/null || true
+  fi
+}
+ge_wait() { ws_wait "$GE_WINESERVER"; }
+
+# Run a command with GE-Proton's Wine (prefix setup stages).
+ge() {
+  env PATH="$GE_PATH" WINESERVER="$GE_WINESERVER" WINEDLLOVERRIDES="$BASE_OVERRIDES" "$@"
+}
+reg_add() {
+  ge wine reg add "$1" /v "$2" /t REG_SZ /d "$3" /f >/dev/null 2>&1 || true
+}
+
+fusion_exe() {
+  # Newest by modification time: the webdeploy tree can also contain a
+  # placeholder deployment holding only a launcher stub.
+  find "$PREFIX/drive_c/Program Files/Autodesk/webdeploy/production" -maxdepth 2 -name Fusion360.exe -printf '%T+ %p\n' 2>/dev/null | sort -r | head -n 1 | cut -d' ' -f2-
+}
+
+install_dxvk() {
+  # Copy the DXVK / vkd3d-proton DLLs bundled with GE-Proton into the
+  # prefix; they are activated by the registry DLL overrides set
+  # during setup. GE-Proton ships them under
+  # files/lib/wine/<pkg>/<arch>-windows/.
+  local sys32="$PREFIX/drive_c/windows/system32"
+  local syswow="$PREFIX/drive_c/windows/syswow64"
+  local dxvk="$GE_DIR/files/lib/wine/dxvk"
+  local vkd3d="$GE_DIR/files/lib/wine/vkd3d-proton"
+  local d
+  [ -d "$sys32" ] || return 0
+  for d in d3d11 dxgi d3d10core d3d9; do
+    cp -f "$dxvk/x86_64-windows/$d.dll" "$sys32/" 2>/dev/null || true
+    cp -f "$dxvk/i386-windows/$d.dll" "$syswow/" 2>/dev/null || true
+  done
+  for d in d3d12 d3d12core; do
+    cp -f "$vkd3d/x86_64-windows/$d.dll" "$sys32/" 2>/dev/null || true
+    cp -f "$vkd3d/i386-windows/$d.dll" "$syswow/" 2>/dev/null || true
+  done
+}
+
+setup_prefix() {
+  mkdir -p "$DOWNLOADS"
+  if [ ! -f "$PREFIX/system.reg" ]; then
+    log "First run: creating Wine prefix in $PREFIX"
+    notify "Setting up Fusion for the first time - this can take a while."
+    ge wine wineboot --init || die "wineboot failed"
+    ge_wait
+  fi
+  if [ -f "$PFX_MARKER" ]; then
+    return 0
+  fi
+  log "Installing the base components (fonts, XML, GDI+)"
+  # Deliberately NOT running winetricks' "sandbox" verb: it deletes
+  # the Z: drive, and without Z: the installers this launcher starts
+  # by Unix path crash inside Wine's loader before they can run
+  # (observed with both bundled Wine builds). Inside the Flatpak
+  # sandbox the verb's other effects are unnecessary anyway.
+  # The wineserver connection in this sandbox occasionally drops
+  # under winetricks' rapid process churn ("Connection reset by
+  # peer"), aborting a verb mid-list. The verbs are idempotent and
+  # completed ones are skipped on a rerun, so retry a few times.
+  local attempt
+  for attempt in 1 2 3; do
+    if ge winetricks -q atmlib gdiplus corefonts cjkfonts msxml4 msxml6; then
+      break
+    fi
+    ge_wait
+    if [ "$attempt" = 3 ]; then
+      die "base winetricks failed"
+    fi
+    log "Base components interrupted; resuming (attempt $((attempt + 1)))"
+  done
+  ge_wait
+  touch "$PFX_MARKER"
+}
+
+run_installer() {
+  # Run the Autodesk streamer in the background and watch for
+  # Fusion360.exe: the streamer re-extracts the whole payload on
+  # every run and only produces the executable near the end, so a
+  # fixed time cap (the community installer's approach) cuts it off
+  # mid-install on a slow machine. The streamer is also known to
+  # linger after the payload lands, so once the executable exists
+  # (plus a short grace period for trailing writes) the session is
+  # shut down instead of waiting for the streamer to exit.
+  ge wine "$INSTALLER" --quiet &
+  local pid=$! i
+  for i in $(seq 1 90); do
+    sleep 20
+    if [ -n "$(fusion_exe)" ]; then
+      sleep 30
+      break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+  done
+  ge_wait
+  wait "$pid" 2>/dev/null || true
+}
+
+setup_fusion() {
+  if [ -z "$(fusion_exe)" ]; then
+    if [ ! -f "$INSTALLER" ]; then
+      log "Downloading the Fusion installer from Autodesk"
+      curl -fL -o "$INSTALLER" "$INSTALLER_URL" || die "installer download failed"
+    fi
+    log "Installing Fusion (first pass)"
+    run_installer
+    if [ -z "$(fusion_exe)" ]; then
+      log "Installing Fusion (second pass)"
+      run_installer
+    fi
+  fi
+  [ -n "$(fusion_exe)" ] || die "Fusion360.exe not found after install"
+  # Fusion's machine-specific options for the DXVK setup.
+  local userdir opts
+  userdir="$(find "$PREFIX/drive_c/users" -mindepth 1 -maxdepth 1 -type d ! -name Public | head -n 1)"
+  if [ -n "$userdir" ] && [ -f "$OPTIONS_XML" ]; then
+    for opts in \
+      "$userdir/AppData/Roaming/Autodesk/Neutron Platform/Options" \
+      "$userdir/AppData/Local/Autodesk/Neutron Platform/Options" \
+      "$userdir/Application Data/Autodesk/Neutron Platform/Options"; do
+      mkdir -p "$opts"
+      cp -f "$OPTIONS_XML" "$opts/NMachineSpecificOptions.xml" || true
+    done
+  fi
+  touch "$MARKER"
+  log "Fusion installed"
+}
+
+setup_extras() {
+  if [ -f "$EXTRAS_MARKER" ]; then
+    return 0
+  fi
+  log "Applying the runtime components (.NET, VC runtimes, WebView2, overrides)"
+  local ok=1 attempt
+  for attempt in 1 2; do
+    if ge winetricks -q dotnet20 dotnet48 vcrun2022 fontsmooth=rgb winhttp win10; then
+      ok=1
+      break
+    fi
+    ok=0
+    ge_wait
+  done
+  if [ "$ok" = 0 ]; then
+    log "warning: runtime winetricks did not complete; will retry next launch"
+  fi
+  ge_wait
+  if [ "$ok" = 1 ]; then
+    ge winetricks -q cjkfonts >/dev/null 2>&1 || true
+    ge winetricks -q win11 || log "warning: could not set Windows 11 mode"
+    ge_wait
+  fi
+  # DLL overrides from the community recipe.
+  reg_add 'HKCU\Software\Wine\DllOverrides' 'adpclientservice.exe' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' 'AdCefWebBrowser.exe' 'builtin'
+  reg_add 'HKCU\Software\Wine\DllOverrides' 'msvcp140' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' 'mfc140u' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' 'bcp47langs' ''
+  reg_add 'HKCU\Software\Wine\X11 Driver' 'Managed' 'Y'
+  reg_add 'HKCU\Software\Wine\X11 Driver' 'Decorated' 'Y'
+  # DXVK activation (same overrides winetricks' dxvk verb sets).
+  reg_add 'HKCU\Software\Wine\DllOverrides' '*d3d11' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' '*d3d10core' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' '*dxgi' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' '*d3d9' 'builtin'
+  ge_wait
+  if [ ! -f "$WEBVIEW2" ]; then
+    log "Downloading the WebView2 runtime from Microsoft"
+    curl -fL -o "$WEBVIEW2" "$WEBVIEW2_URL" || log "warning: WebView2 download failed"
+  fi
+  if [ -f "$WEBVIEW2" ]; then
+    log "Installing the WebView2 runtime"
+    ge wine "$WEBVIEW2" /silent /install || log "warning: WebView2 installer exited nonzero"
+    ge_wait
+  fi
+  if [ "$ok" = 1 ]; then
+    touch "$EXTRAS_MARKER"
+    log "Runtime components complete"
+  fi
+  ge_wait
+}
+
+launch() {
+  local exe
+  exe="$(fusion_exe)"
+  [ -n "$exe" ] || die "Fusion360.exe not found in prefix"
+  install_dxvk
+  export WINEDLLOVERRIDES="$BASE_OVERRIDES"
+  if [ -n "${FUSION_DEBUG:-}" ]; then
+    export WINEDEBUG=-fixme
+  else
+    export WINEDEBUG=-all
+  fi
+  log "Starting Fusion: $exe"
+  exec wine "$exe" "$@"
+}
+
+handle_idmgr_url() {
+  # adskidmgr:// URLs are the sign-in callback from the browser; hand
+  # them to Autodesk's identity manager inside the prefix.
+  local mgr
+  mgr="$(find "$PREFIX/drive_c" -name 'AdskIdentityManager.exe' 2>/dev/null | head -n 1)"
+  if [ -n "$mgr" ]; then
+    export WINEDLLOVERRIDES="$BASE_OVERRIDES"
+    exec wine "$mgr" "$1"
+  fi
+  log "Received a sign-in callback, but AdskIdentityManager.exe was not found."
+  exit 0
+}
+
+main() {
+  if [[ "${1:-}" == adskidmgr://* ]]; then
+    handle_idmgr_url "$1"
+  fi
+  if [ ! -f "$MARKER" ] || [ -z "$(fusion_exe)" ]; then
+    setup_prefix
+    setup_fusion
+  fi
+  setup_extras
+  launch "$@"
+}
+
+main "$@"

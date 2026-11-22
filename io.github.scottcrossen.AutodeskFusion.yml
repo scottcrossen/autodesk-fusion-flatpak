@@ -1,0 +1,97 @@
+id: io.github.scottcrossen.AutodeskFusion
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+command: autodesk-fusion
+finish-args:
+  - --allow=devel
+  - --allow=multiarch
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --share=network
+  - --socket=pulseaudio
+  - --filesystem=xdg-download:create
+  - --talk-name=org.freedesktop.Notifications
+add-extensions:
+  org.freedesktop.Platform.Compat.i386:
+    directory: lib/i386-linux-gnu
+    version: '25.08'
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/man
+  - /share/doc
+modules:
+  - name: cabextract
+    buildsystem: autotools
+    sources:
+      - type: archive
+        url: https://www.cabextract.org.uk/cabextract-1.11.tar.gz
+        sha256: b5546db1155e4c718ff3d4b278573604f30dd64c3c5bfd4657cd089b823a3ac6
+  - name: p7zip
+    buildsystem: simple
+    build-commands:
+      - cp makefile.linux_any_cpu_gcc_4.X makefile.machine
+      - make -j$FLATPAK_BUILDER_N_JOBS all3
+      - install -Dm755 bin/7za /app/bin/7za
+      - install -Dm755 bin/7zr /app/bin/7zr
+      - install -Dm755 bin/7z /app/lib/p7zip/7z
+      - install -Dm755 bin/7z.so /app/lib/p7zip/7z.so
+      - if [ -d bin/Codecs ]; then cp -a bin/Codecs /app/lib/p7zip/; fi
+      - install -Dm755 7z /app/bin/7z
+    sources:
+      - type: script
+        dest-filename: 7z
+        commands:
+          - exec /app/lib/p7zip/7z "$@"
+      - type: archive
+        url: https://github.com/p7zip-project/p7zip/archive/refs/tags/v17.05.tar.gz
+        sha256: d2788f892571058c08d27095c22154579dfefb807ebe357d145ab2ddddefb1a6
+  - name: winetricks
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 src/winetricks /app/bin/winetricks
+    sources:
+      - type: archive
+        url: https://github.com/Winetricks/winetricks/archive/refs/tags/20250102.tar.gz
+        sha256: 24d339806e3309274ee70743d76ff7b965fef5a534c001916d387c924eebe42e
+  - name: ge-proton
+    buildsystem: simple
+    build-options:
+      strip: false
+      no-debuginfo: true
+    build-commands:
+      - mkdir -p /app/ge-proton
+      - cp -a . /app/ge-proton/
+      - chmod -R u+w /app/ge-proton
+    sources:
+      - type: archive
+        url: https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton11-12/GE-Proton11-12-x86_64.tar.gz
+        sha512: 2e37447902529c9fc39138dc0b3f24aed3513b59a190b825e6b4a668e49e2033bdf6b8a7998e8686e067bbb3f61f3a6633e2408f0cc96f6dad983bd18e2db31e
+  - name: autodesk-fusion
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/lib/i386-linux-gnu
+      - install -Dm755 autodesk-fusion /app/bin/autodesk-fusion
+      - install -Dm644 io.github.scottcrossen.AutodeskFusion.desktop /app/share/applications/io.github.scottcrossen.AutodeskFusion.desktop
+      - install -Dm644 io.github.scottcrossen.AutodeskFusion.AdskIdentityManager.desktop /app/share/applications/io.github.scottcrossen.AutodeskFusion.AdskIdentityManager.desktop
+      - install -Dm644 io.github.scottcrossen.AutodeskFusion.metainfo.xml /app/share/metainfo/io.github.scottcrossen.AutodeskFusion.metainfo.xml
+      - install -Dm644 io.github.scottcrossen.AutodeskFusion.svg /app/share/icons/hicolor/scalable/apps/io.github.scottcrossen.AutodeskFusion.svg
+      - install -Dm644 NMachineSpecificOptions.xml /app/share/autodesk-fusion/NMachineSpecificOptions.xml
+    sources:
+      - type: file
+        path: autodesk-fusion
+      - type: file
+        path: io.github.scottcrossen.AutodeskFusion.desktop
+      - type: file
+        path: io.github.scottcrossen.AutodeskFusion.AdskIdentityManager.desktop
+      - type: file
+        path: io.github.scottcrossen.AutodeskFusion.metainfo.xml
+      - type: file
+        path: io.github.scottcrossen.AutodeskFusion.svg
+      - type: file
+        url: https://codeberg.org/cryinkfly/Autodesk-Fusion-360-on-Linux/raw/branch/main/files/setup/resource/video_driver/DXVK/NMachineSpecificOptions.xml
+        sha256: 9e2747c651a7a48cdaa9053c27ee54f9b74b50f42bb14219011354e6fe97f74a
+        dest-filename: NMachineSpecificOptions.xml

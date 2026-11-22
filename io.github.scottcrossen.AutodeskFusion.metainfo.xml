@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.scottcrossen.AutodeskFusion</id>
+  <name>Autodesk Fusion</name>
+  <summary>Run Autodesk Fusion on Linux via Wine</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer_name>Scott Crossen</developer_name>
+  <description>
+    <p>Unofficial Flatpak packaging that runs Autodesk Fusion on Linux. The package bundles GE-Proton (Wine), winetricks, p7zip and cabextract; on first launch it creates a dedicated Wine prefix in the app's data directory, installs Fusion from Autodesk's official installer, and applies the community-documented compatibility fixes. Fusion itself is downloaded from Autodesk at first run and is not redistributed with this package.</p>
+  </description>
+  <launchable type="desktop-id">io.github.scottcrossen.AutodeskFusion.desktop</launchable>
+  <url type="homepage">https://github.com/scottcrossen/autodesk-fusion-flatpak</url>
+  <categories>
+    <category>Graphics</category>
+    <category>Engineering</category>
+  </categories>
+  <provides>
+    <binary>autodesk-fusion</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.0.0" date="2026-11-20"/>
+  </releases>
+</component>
