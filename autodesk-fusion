@@ -14,7 +14,10 @@
 #
 # Setup order is the order verified end-to-end on the target
 # machine: the prefix gets the light components first and Fusion
-# is installed in that state. The remaining components from the
+# is installed in that state. After the install, a small binary
+# patch is applied to Fusion's bundled Qt platform plugin (see
+# setup_patch below): without it Fusion crashes at startup under
+# Wine before its first window appears. The remaining components from the
 # cryinkfly recipe (.NET, VC runtimes, WebView2, DLL overrides,
 # Windows 11 mode) are applied after the install, best-effort:
 # they serve Fusion at run time, so a failure there is logged but
@@ -101,6 +104,15 @@ install_dxvk() {
   for d in d3d12 d3d12core; do
     cp -f "$vkd3d/x86_64-windows/$d.dll" "$sys32/" 2>/dev/null || true
     cp -f "$vkd3d/i386-windows/$d.dll" "$syswow/" 2>/dev/null || true
+  done
+  # GE-Proton's wined3d also loads the standalone libvkd3d pair that
+  # Proton's own launcher copies from files/lib/vkd3d/; a prefix whose
+  # system32 holds a d3d12 DLL but lacks these fails to load Qt's GUI
+  # libraries at all.
+  local libvkd3d="$GE_DIR/files/lib/vkd3d"
+  for d in libvkd3d-1 libvkd3d-shader-1; do
+    cp -f "$libvkd3d/x86_64-windows/$d.dll" "$sys32/" 2>/dev/null || true
+    cp -f "$libvkd3d/i386-windows/$d.dll" "$syswow/" 2>/dev/null || true
   done
 }
 
@@ -193,6 +205,85 @@ setup_fusion() {
   log "Fusion installed"
 }
 
+setup_patch() {
+  # Fusion 2706's bundled Qt (qwindows.dll 6.8.101) dereferences the
+  # QWindowsTheme singleton without a null check in two places:
+  # WindowCreationData::create (right after CreateWindowEx) and
+  # QWindowsWindow::windowEvent (on ApplicationPaletteChange). Under
+  # Wine the theme object does not exist yet at either point, so
+  # Fusion page-faults seconds after launch, before any window is
+  # usable. (Upstream Qt has the same unguarded calls in 6.10; a
+  # third call site got a Wine-specific guard in QTBUG-85734, these
+  # two never did.)
+  #
+  # The patch stubs each call sequence to behave as if the theme
+  # reported ColorScheme::Light, so the dark-title-bar branch is
+  # skipped. It is byte-verified: it applies only when the DLL
+  # matches the known build exactly at both sites, keeps the
+  # original as qwindows.dll.bak, and is a no-op once applied (so a
+  # Fusion auto-update that ships a fixed or different DLL simply
+  # skips it, with a warning in the different case). A failure here
+  # never blocks the launch.
+  local exe dll
+  exe="$(fusion_exe)"
+  [ -n "$exe" ] || return 0
+  dll="$(dirname "$exe")/plugins/platforms/qwindows.dll"
+  [ -f "$dll" ] || return 0
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "warning: python3 not available; cannot apply the Qt startup patch"
+    return 0
+  fi
+  python3 - "$dll" <<'PYEOF' || log "warning: Qt startup patch step failed"
+import struct, shutil, sys
+path = sys.argv[1]
+data = bytearray(open(path, 'rb').read())
+pe = struct.unpack_from('<I', data, 0x3c)[0]
+nsec = struct.unpack_from('<H', data, pe + 6)[0]
+optsz = struct.unpack_from('<H', data, pe + 20)[0]
+text = None
+for i in range(nsec):
+    off = pe + 24 + optsz + i * 40
+    name = data[off:off + 8].rstrip(b'\0').decode()
+    vsz, va, rsz, ra = struct.unpack_from('<IIII', data, off + 8)
+    if name == '.text':
+        text = (va, ra)
+if text is None:
+    print('[autodesk-fusion] patch: no .text section; skipping')
+    sys.exit(0)
+tva, tra = text
+sites = [
+    (0x5c2a7,
+     bytes.fromhex('488b0d3a6c0700488b01488b4040ff15a5420300'),
+     bytes.fromhex('b801000000') + b'\x90' * 15),
+    (0x66836,
+     bytes.fromhex('488b01488b4040ff151d9d0200'),
+     bytes.fromhex('b801000000') + b'\x90' * 8),
+]
+state = []
+for rva, orig, repl in sites:
+    foff = tra + (rva - tva)
+    cur = bytes(data[foff:foff + len(orig)])
+    if cur == repl:
+        state.append('patched')
+    elif cur == orig:
+        state.append('original')
+    else:
+        state.append('unknown')
+if all(s == 'patched' for s in state):
+    sys.exit(0)
+if any(s == 'unknown' for s in state):
+    print('[autodesk-fusion] patch: qwindows.dll does not match the known build; skipping')
+    sys.exit(0)
+shutil.copy2(path, path + '.bak')
+for (rva, orig, repl), s in zip(sites, state):
+    if s == 'original':
+        foff = tra + (rva - tva)
+        data[foff:foff + len(repl)] = repl
+open(path, 'wb').write(bytes(data))
+print('[autodesk-fusion] patch: applied the Qt startup patch to qwindows.dll')
+PYEOF
+}
+
 setup_extras() {
   if [ -f "$EXTRAS_MARKER" ]; then
     return 0
@@ -230,6 +321,20 @@ setup_extras() {
   reg_add 'HKCU\Software\Wine\DllOverrides' '*dxgi' 'native'
   reg_add 'HKCU\Software\Wine\DllOverrides' '*d3d9' 'builtin'
   ge_wait
+  # The identity SDK looks up the identity manager's location in
+  # HKLM\SOFTWARE\Autodesk\AdskIdentityManager; the Fusion streamer
+  # never writes that key, so the SDK logs a lookup failure and uses
+  # a fallback path. Register the copy bundled with Fusion.
+  local mgr rel mgrwin
+  mgr="$(find "$PREFIX/drive_c" -name 'AdskIdentityManager.exe' 2>/dev/null | head -n 1)"
+  if [ -n "$mgr" ]; then
+    rel="${mgr#$PREFIX/drive_c/}"
+    rel="${rel%/AdskIdentityManager.exe}"
+    mgrwin="C:\\${rel//\//\\}"
+    ge wine reg add 'HKLM\SOFTWARE\Autodesk\AdskIdentityManager' /ve /d "$mgrwin" /f >/dev/null 2>&1 || true
+    ge wine reg add 'HKLM\SOFTWARE\Autodesk\AdskIdentityManager' /v Path /d "$mgrwin" /f >/dev/null 2>&1 || true
+    ge_wait
+  fi
   if [ ! -f "$WEBVIEW2" ]; then
     log "Downloading the WebView2 runtime from Microsoft"
     curl -fL -o "$WEBVIEW2" "$WEBVIEW2_URL" || log "warning: WebView2 download failed"
@@ -282,6 +387,7 @@ main() {
     setup_prefix
     setup_fusion
   fi
+  setup_patch
   setup_extras
   launch "$@"
 }
