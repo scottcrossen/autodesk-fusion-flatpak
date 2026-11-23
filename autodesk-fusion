@@ -351,6 +351,36 @@ setup_extras() {
   ge_wait
 }
 
+start_identity_manager() {
+  # Fusion's identity plugin gives the SSO server only a moment to be
+  # ready. On Windows the identity manager is effectively resident, so
+  # that check passes; under Wine every launch cold-starts it, the
+  # check times out (error 3213) and sign-in never initializes. Start
+  # the manager first and wait until it reports ready, so the plugin
+  # finds a warm server. Best-effort: never delays the launch by more
+  # than about a minute.
+  local mgr idlog base i
+  mgr="$(find "$PREFIX/drive_c" -name 'AdskIdentityManager.exe' 2>/dev/null | head -n 1)"
+  [ -n "$mgr" ] || return 0
+  idlog="$(find "$PREFIX/drive_c/users" -name 'IdServices.log' 2>/dev/null | head -n 1)"
+  base=0
+  [ -n "$idlog" ] && base="$(wc -l < "$idlog")"
+  log "Starting the identity manager ahead of Fusion"
+  wine "$mgr" >/dev/null 2>&1 &
+  if [ -n "$idlog" ]; then
+    for i in $(seq 1 30); do
+      sleep 2
+      if tail -n +"$((base + 1))" "$idlog" 2>/dev/null | grep -q 'SSO Server is ready'; then
+        log "Identity manager is ready"
+        return 0
+      fi
+    done
+    log "Identity manager did not report ready in time; launching anyway"
+  else
+    sleep 10
+  fi
+}
+
 launch() {
   local exe
   exe="$(fusion_exe)"
@@ -362,6 +392,7 @@ launch() {
   else
     export WINEDEBUG=-all
   fi
+  start_identity_manager
   log "Starting Fusion: $exe"
   exec wine "$exe" "$@"
 }
