@@ -24,6 +24,14 @@
 # does not block the launch, and the stage is retried on the next
 # launch until it completes once.
 #
+# A final stage (setup_runtime_fixes) repairs gaps the installer
+# leaves under Wine that otherwise stall Fusion's first start:
+# the unpopulated material library its engine loads, the staging
+# server config, the identity manager's signed idle-quit config,
+# the legacy AdSSO component's missing VC++ runtime, and the FCDR
+# component cache Fusion never downloads for itself. Each repair
+# is state-checked, idempotent and best-effort.
+#
 # Everything mutable lives under $XDG_DATA_HOME/autodesk-fusion, which
 # for this Flatpak is ~/.var/app/io.github.scottcrossen.AutodeskFusion/data,
 # so removing the app's data removes the whole installation.
@@ -351,6 +359,142 @@ setup_extras() {
   ge_wait
 }
 
+fix_material_library() {
+  # Fusion launches its material engine (adexmtsv.exe) with a config
+  # from the webdeploy tree's "MaterialLibrary/Material Library"
+  # folder, but the installer under Wine never populates that folder
+  # (the full library lands only in the shared ProgramData tree).
+  # The engine dies instantly on the missing config and Fusion's
+  # startup waits on the engine's pipe forever. Copy the shared
+  # library into the webdeploy folder.
+  local base="$1" dest src
+  dest="$base/MaterialLibrary/Material Library"
+  [ -f "$dest/adexmtsv_prod.cfg" ] && return 0
+  src="$(find "$PREFIX/drive_c/ProgramData/Autodesk/Common/Material Library" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r | head -n 1)"
+  [ -n "$src" ] && [ -f "$src/adexmtsv_prod.cfg" ] || return 0
+  mkdir -p "$dest" || return 0
+  log "Populating Fusion's material library from the shared Autodesk library"
+  cp -a "$src/." "$dest/" || log "warning: material library copy failed"
+}
+
+fix_server_config() {
+  # The bootstrap "Fusion 360.server.config" in the build tree is a
+  # staging config (staging endpoints); the production config ships
+  # in the same tree. Swap it in (the FRR cache seeded below also
+  # overrides it, but the bootstrap is what Fusion reads first).
+  local base="$1" cfg prod
+  cfg="$base/Fusion 360.server.config"
+  prod="$base/Neutron/Server/Base/Options/Application/ApplicationOptions.production.json"
+  [ -f "$cfg" ] && [ -f "$prod" ] || return 0
+  grep -q 'staging' "$cfg" || return 0
+  [ -f "$cfg.staging-bak" ] || cp -f "$cfg" "$cfg.staging-bak" || return 0
+  log "Replacing Fusion's staging server config with the production config"
+  cp -f "$prod" "$cfg" || log "warning: server config swap failed"
+}
+
+fix_identity_manager_config() {
+  # The identity manager's config is signed (edits fail its
+  # signature check) and sets a ~30-second idle quit: started cold
+  # by the launcher, it exits again before Fusion has finished
+  # starting. With the config set aside the manager falls back to
+  # its built-in defaults (same process/server names, 5-minute
+  # idle), which is long enough. The original is kept alongside.
+  local base="$1" cfg
+  cfg="$base/Autodesk Identity Manager/AdskIdentityManager.config"
+  [ -f "$cfg" ] || return 0
+  [ -f "$cfg.orig-bak" ] || cp -f "$cfg" "$cfg.orig-bak" || return 0
+  log "Setting aside the identity manager's signed config so it stays resident"
+  mv -f "$cfg" "$cfg.disabled" || log "warning: could not set aside the identity manager config"
+}
+
+fix_adsso_runtimes() {
+  # The standalone AdSSO install (when present) ships no VC++
+  # runtime, so AdSSO.exe dies instantly with a loader error and
+  # the legacy SSO client waits on it forever. Copy the runtime
+  # app-local from the identity manager's folder.
+  local base="$1" dir dll
+  dir="$PREFIX/drive_c/Program Files/Autodesk/Autodesk AdSSO"
+  [ -f "$dir/AdSSO.exe" ] || return 0
+  [ -f "$dir/msvcp140.dll" ] && return 0
+  for dll in msvcp140.dll vcruntime140.dll vcruntime140_1.dll; do
+    cp -f "$base/Autodesk Identity Manager/$dll" "$dir/" 2>/dev/null || true
+  done
+  [ -f "$dir/msvcp140.dll" ] && log "Supplied the VC++ runtime to the legacy AdSSO component"
+  return 0
+}
+
+seed_fcdr() {
+  # Download one FCDR component set into $1 for client version $2.
+  # fcdr.json is written last: its absence is what makes the caller
+  # retry on the next launch, so a partial seed never sticks.
+  local dest="$1" version="$2" tmp list id ver url out
+  tmp="$(mktemp -d)" || return 1
+  if ! curl -fsSL -o "$tmp/components.json" "https://api.aps.autodesk.com/fcdr/v1/components?clientId=Fremont&clientVersion=$version"; then
+    rm -rf "$tmp"; return 1
+  fi
+  list="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [print("%s\t%s\t%s" % (c["id"], c["version"], c["artifactZipFileUrl"])) for c in d.get("components",[])]' "$tmp/components.json")" || { rm -rf "$tmp"; return 1; }
+  [ -n "$list" ] || { rm -rf "$tmp"; return 1; }
+  mkdir -p "$dest/fcdr" || { rm -rf "$tmp"; return 1; }
+  while IFS=$'\t' read -r id ver url; do
+    [ -n "$id" ] || continue
+    out="$dest/fcdr/$id/$ver"
+    mkdir -p "$out" || { rm -rf "$tmp"; return 1; }
+    if ! curl -fsSL -o "$tmp/comp.zip" "$url"; then rm -rf "$tmp"; return 1; fi
+    if ! python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$tmp/comp.zip" "$out"; then
+      rm -rf "$tmp"; return 1
+    fi
+  done < <(printf '%s\n' "$list")
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["softwareVersion"]=sys.argv[3]; json.dump(d, open(sys.argv[2],"w"))' "$tmp/components.json" "$dest/fcdr.json" "$version" || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  return 0
+}
+
+fix_fcdr_cache() {
+  # Fusion's own FCDR component download never fires under Wine
+  # (it attempts no outbound connection at all), so without a
+  # seeded cache the region registry falls back to the bootstrap
+  # config. Seed the cache Fusion would have downloaded: the
+  # component list for this build's version, plus a
+  # "softwareVersion" key (the cache loader rejects the bare
+  # server response without it). Every user profile in the prefix
+  # is seeded; which one Proton uses is not fixed.
+  local base="$1" version userdir dest
+  [ -f "$base/fusion_version.txt" ] || return 0
+  version="$(tr -d '[:space:]' < "$base/fusion_version.txt")"
+  [ -n "$version" ] || return 0
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "warning: python3 not available; cannot seed the FCDR component cache"
+    return 0
+  fi
+  for userdir in "$PREFIX/drive_c/users"/*/; do
+    [ -d "$userdir" ] || continue
+    [ "$(basename "$userdir")" = Public ] && continue
+    dest="${userdir}AppData/Roaming/Autodesk/Neutron Platform/fcdr/$version"
+    [ -f "$dest/fcdr.json" ] && continue
+    log "Seeding the FCDR component cache (client version $version)"
+    if ! seed_fcdr "$dest" "$version"; then
+      log "warning: FCDR cache seed failed; will retry next launch"
+    fi
+  done
+  return 0
+}
+
+setup_runtime_fixes() {
+  # Repairs for gaps the installer leaves under Wine, each
+  # state-checked and idempotent, all best-effort: the material
+  # library, the production server config, the identity manager's
+  # idle quit, the legacy AdSSO runtime, and the FCDR cache.
+  local exe base
+  exe="$(fusion_exe)"
+  [ -n "$exe" ] || return 0
+  base="$(dirname "$exe")"
+  fix_material_library "$base"
+  fix_server_config "$base"
+  fix_identity_manager_config "$base"
+  fix_adsso_runtimes "$base"
+  fix_fcdr_cache "$base"
+}
+
 start_identity_manager() {
   # Fusion's identity plugin gives the SSO server only a moment to be
   # ready. On Windows the identity manager is effectively resident, so
@@ -420,6 +564,7 @@ main() {
   fi
   setup_patch
   setup_extras
+  setup_runtime_fixes
   launch "$@"
 }
 
