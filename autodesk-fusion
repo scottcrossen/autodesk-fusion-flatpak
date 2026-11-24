@@ -1,0 +1,634 @@
+#!/bin/bash
+# autodesk-fusion - launcher for the Autodesk Fusion Flatpak.
+#
+# GE-Proton's Wine does everything here: it creates the prefix,
+# installs Fusion, and runs it, and it supplies the DXVK /
+# vkd3d-proton DLLs copied into the prefix. The community recipe
+# (cryinkfly) pairs Fusion with a custom "fusion-wine-build" for
+# the launch, but on the target machine that build crashes during
+# Fusion's window creation even with the full recipe applied,
+# while GE-Proton's Wine runs it - so this package deliberately
+# does not bundle the community build. (That build also cannot
+# create a working prefix: it does not register the standard
+# Windows services on wineboot, which breaks installers.)
+#
+# Setup order is the order verified end-to-end on the target
+# machine: the prefix gets the light components first and Fusion
+# is installed in that state. After the install, a small binary
+# patch is applied to Fusion's bundled Qt platform plugin (see
+# setup_patch below): without it Fusion crashes at startup under
+# Wine before its first window appears. The remaining components from the
+# cryinkfly recipe (.NET, VC runtimes, WebView2, DLL overrides,
+# Windows 11 mode) are applied after the install, best-effort:
+# they serve Fusion at run time, so a failure there is logged but
+# does not block the launch, and the stage is retried on the next
+# launch until it completes once.
+#
+# A final stage (setup_runtime_fixes) repairs gaps the installer
+# leaves under Wine that otherwise stall Fusion's first start:
+# the unpopulated material library its engine loads, the staging
+# server config, the identity manager's signed idle-quit config,
+# the legacy AdSSO component's missing VC++ runtime, the FCDR
+# component cache Fusion never downloads for itself, and any files
+# an incompletely extracted streamer package left out of the tree
+# (the Electronics add-ins). Each repair is state-checked,
+# idempotent and best-effort. The launch also defaults to software
+# GL rendering and an unsandboxed embedded Chromium: with a
+# proprietary NVIDIA host driver, GPU GL under Wine hangs Fusion's
+# startup, and the Chromium sandbox blanks its web views.
+#
+# Everything mutable lives under $XDG_DATA_HOME/autodesk-fusion, which
+# for this Flatpak is ~/.var/app/io.github.scottcrossen.AutodeskFusion/data,
+# so removing the app's data removes the whole installation.
+set -u
+
+GE_DIR=/app/ge-proton
+GE_PATH="$GE_DIR/files/bin:/app/bin:$PATH"
+GE_WINESERVER="$GE_DIR/files/bin/wineserver"
+export PATH="$GE_PATH"
+export WINESERVER="$GE_WINESERVER"
+
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/autodesk-fusion"
+PREFIX="$DATA/prefix"
+DOWNLOADS="$DATA/downloads"
+MARKER="$DATA/.fusion-installed"
+PFX_MARKER="$DATA/.prefix-v4-done"
+EXTRAS_MARKER="$DATA/.extras-v4-done"
+INSTALLER_URL="https://dl.appstreaming.autodesk.com/production/installers/Fusion%20Admin%20Install.exe"
+INSTALLER="$DOWNLOADS/Fusion Admin Install.exe"
+WEBVIEW2_URL="https://go.microsoft.com/fwlink/?linkid=2124701"
+WEBVIEW2="$DOWNLOADS/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+OPTIONS_XML=/app/share/autodesk-fusion/NMachineSpecificOptions.xml
+
+export WINEPREFIX="$PREFIX"
+export WINEARCH=win64
+export DXVK_LOG_LEVEL=none
+BASE_OVERRIDES="winemenubuilder.exe=d"
+
+log() { printf '[autodesk-fusion] %s\n' "$*"; }
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a "Autodesk Fusion" "Autodesk Fusion" "$1" || true
+  fi
+}
+die() { log "ERROR: $*"; notify "Setup failed: $*"; exit 1; }
+
+# Bounded wait for a prefix's wineserver: if the server does not exit
+# on its own, kill it (safe between steps; the next command starts a
+# fresh one). $1 = wineserver binary.
+ws_wait() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 20 "$1" -w 2>/dev/null || "$1" -k 2>/dev/null || true
+  else
+    "$1" -w 2>/dev/null || true
+  fi
+}
+ge_wait() { ws_wait "$GE_WINESERVER"; }
+
+# Run a command with GE-Proton's Wine (prefix setup stages).
+ge() {
+  env PATH="$GE_PATH" WINESERVER="$GE_WINESERVER" WINEDLLOVERRIDES="$BASE_OVERRIDES" "$@"
+}
+reg_add() {
+  ge wine reg add "$1" /v "$2" /t REG_SZ /d "$3" /f >/dev/null 2>&1 || true
+}
+
+fusion_exe() {
+  # Newest by modification time: the webdeploy tree can also contain a
+  # placeholder deployment holding only a launcher stub.
+  find "$PREFIX/drive_c/Program Files/Autodesk/webdeploy/production" -maxdepth 2 -name Fusion360.exe -printf '%T+ %p\n' 2>/dev/null | sort -r | head -n 1 | cut -d' ' -f2-
+}
+
+install_dxvk() {
+  # Copy the DXVK / vkd3d-proton DLLs bundled with GE-Proton into the
+  # prefix; they are activated by the registry DLL overrides set
+  # during setup. GE-Proton ships them under
+  # files/lib/wine/<pkg>/<arch>-windows/.
+  local sys32="$PREFIX/drive_c/windows/system32"
+  local syswow="$PREFIX/drive_c/windows/syswow64"
+  local dxvk="$GE_DIR/files/lib/wine/dxvk"
+  local vkd3d="$GE_DIR/files/lib/wine/vkd3d-proton"
+  local d
+  [ -d "$sys32" ] || return 0
+  for d in d3d11 dxgi d3d10core d3d9; do
+    cp -f "$dxvk/x86_64-windows/$d.dll" "$sys32/" 2>/dev/null || true
+    cp -f "$dxvk/i386-windows/$d.dll" "$syswow/" 2>/dev/null || true
+  done
+  for d in d3d12 d3d12core; do
+    cp -f "$vkd3d/x86_64-windows/$d.dll" "$sys32/" 2>/dev/null || true
+    cp -f "$vkd3d/i386-windows/$d.dll" "$syswow/" 2>/dev/null || true
+  done
+  # GE-Proton's wined3d also loads the standalone libvkd3d pair that
+  # Proton's own launcher copies from files/lib/vkd3d/; a prefix whose
+  # system32 holds a d3d12 DLL but lacks these fails to load Qt's GUI
+  # libraries at all.
+  local libvkd3d="$GE_DIR/files/lib/vkd3d"
+  for d in libvkd3d-1 libvkd3d-shader-1; do
+    cp -f "$libvkd3d/x86_64-windows/$d.dll" "$sys32/" 2>/dev/null || true
+    cp -f "$libvkd3d/i386-windows/$d.dll" "$syswow/" 2>/dev/null || true
+  done
+}
+
+setup_prefix() {
+  mkdir -p "$DOWNLOADS"
+  if [ ! -f "$PREFIX/system.reg" ]; then
+    log "First run: creating Wine prefix in $PREFIX"
+    notify "Setting up Fusion for the first time - this can take a while."
+    ge wine wineboot --init || die "wineboot failed"
+    ge_wait
+  fi
+  if [ -f "$PFX_MARKER" ]; then
+    return 0
+  fi
+  log "Installing the base components (fonts, XML, GDI+)"
+  # Deliberately NOT running winetricks' "sandbox" verb: it deletes
+  # the Z: drive, and without Z: the installers this launcher starts
+  # by Unix path crash inside Wine's loader before they can run
+  # (observed with both bundled Wine builds). Inside the Flatpak
+  # sandbox the verb's other effects are unnecessary anyway.
+  # The wineserver connection in this sandbox occasionally drops
+  # under winetricks' rapid process churn ("Connection reset by
+  # peer"), aborting a verb mid-list. The verbs are idempotent and
+  # completed ones are skipped on a rerun, so retry a few times.
+  local attempt
+  for attempt in 1 2 3; do
+    if ge winetricks -q atmlib gdiplus corefonts cjkfonts msxml4 msxml6; then
+      break
+    fi
+    ge_wait
+    if [ "$attempt" = 3 ]; then
+      die "base winetricks failed"
+    fi
+    log "Base components interrupted; resuming (attempt $((attempt + 1)))"
+  done
+  ge_wait
+  touch "$PFX_MARKER"
+}
+
+run_installer() {
+  # Run the Autodesk streamer in the background and watch for
+  # Fusion360.exe: the streamer re-extracts the whole payload on
+  # every run and only produces the executable near the end, so a
+  # fixed time cap (the community installer's approach) cuts it off
+  # mid-install on a slow machine. The streamer is also known to
+  # linger after the payload lands, so once the executable exists
+  # (plus a short grace period for trailing writes) the session is
+  # shut down instead of waiting for the streamer to exit.
+  ge wine "$INSTALLER" --quiet &
+  local pid=$! i
+  for i in $(seq 1 90); do
+    sleep 20
+    if [ -n "$(fusion_exe)" ]; then
+      sleep 30
+      break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+  done
+  ge_wait
+  wait "$pid" 2>/dev/null || true
+}
+
+setup_fusion() {
+  if [ -z "$(fusion_exe)" ]; then
+    if [ ! -f "$INSTALLER" ]; then
+      log "Downloading the Fusion installer from Autodesk"
+      curl -fL -o "$INSTALLER" "$INSTALLER_URL" || die "installer download failed"
+    fi
+    log "Installing Fusion (first pass)"
+    run_installer
+    if [ -z "$(fusion_exe)" ]; then
+      log "Installing Fusion (second pass)"
+      run_installer
+    fi
+  fi
+  [ -n "$(fusion_exe)" ] || die "Fusion360.exe not found after install"
+  # Fusion's machine-specific options for the DXVK setup.
+  local userdir opts
+  userdir="$(find "$PREFIX/drive_c/users" -mindepth 1 -maxdepth 1 -type d ! -name Public | head -n 1)"
+  if [ -n "$userdir" ] && [ -f "$OPTIONS_XML" ]; then
+    for opts in \
+      "$userdir/AppData/Roaming/Autodesk/Neutron Platform/Options" \
+      "$userdir/AppData/Local/Autodesk/Neutron Platform/Options" \
+      "$userdir/Application Data/Autodesk/Neutron Platform/Options"; do
+      mkdir -p "$opts"
+      cp -f "$OPTIONS_XML" "$opts/NMachineSpecificOptions.xml" || true
+    done
+  fi
+  touch "$MARKER"
+  log "Fusion installed"
+}
+
+setup_patch() {
+  # Fusion 2706's bundled Qt (qwindows.dll 6.8.101) dereferences the
+  # QWindowsTheme singleton without a null check in two places:
+  # WindowCreationData::create (right after CreateWindowEx) and
+  # QWindowsWindow::windowEvent (on ApplicationPaletteChange). Under
+  # Wine the theme object does not exist yet at either point, so
+  # Fusion page-faults seconds after launch, before any window is
+  # usable. (Upstream Qt has the same unguarded calls in 6.10; a
+  # third call site got a Wine-specific guard in QTBUG-85734, these
+  # two never did.)
+  #
+  # The patch stubs each call sequence to behave as if the theme
+  # reported ColorScheme::Light, so the dark-title-bar branch is
+  # skipped. It is byte-verified: it applies only when the DLL
+  # matches the known build exactly at both sites, keeps the
+  # original as qwindows.dll.bak, and is a no-op once applied (so a
+  # Fusion auto-update that ships a fixed or different DLL simply
+  # skips it, with a warning in the different case). A failure here
+  # never blocks the launch.
+  local exe dll
+  exe="$(fusion_exe)"
+  [ -n "$exe" ] || return 0
+  dll="$(dirname "$exe")/plugins/platforms/qwindows.dll"
+  [ -f "$dll" ] || return 0
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "warning: python3 not available; cannot apply the Qt startup patch"
+    return 0
+  fi
+  python3 - "$dll" <<'PYEOF' || log "warning: Qt startup patch step failed"
+import struct, shutil, sys
+path = sys.argv[1]
+data = bytearray(open(path, 'rb').read())
+pe = struct.unpack_from('<I', data, 0x3c)[0]
+nsec = struct.unpack_from('<H', data, pe + 6)[0]
+optsz = struct.unpack_from('<H', data, pe + 20)[0]
+text = None
+for i in range(nsec):
+    off = pe + 24 + optsz + i * 40
+    name = data[off:off + 8].rstrip(b'\0').decode()
+    vsz, va, rsz, ra = struct.unpack_from('<IIII', data, off + 8)
+    if name == '.text':
+        text = (va, ra)
+if text is None:
+    print('[autodesk-fusion] patch: no .text section; skipping')
+    sys.exit(0)
+tva, tra = text
+sites = [
+    (0x5c2a7,
+     bytes.fromhex('488b0d3a6c0700488b01488b4040ff15a5420300'),
+     bytes.fromhex('b801000000') + b'\x90' * 15),
+    (0x66836,
+     bytes.fromhex('488b01488b4040ff151d9d0200'),
+     bytes.fromhex('b801000000') + b'\x90' * 8),
+]
+state = []
+for rva, orig, repl in sites:
+    foff = tra + (rva - tva)
+    cur = bytes(data[foff:foff + len(orig)])
+    if cur == repl:
+        state.append('patched')
+    elif cur == orig:
+        state.append('original')
+    else:
+        state.append('unknown')
+if all(s == 'patched' for s in state):
+    sys.exit(0)
+if any(s == 'unknown' for s in state):
+    print('[autodesk-fusion] patch: qwindows.dll does not match the known build; skipping')
+    sys.exit(0)
+shutil.copy2(path, path + '.bak')
+for (rva, orig, repl), s in zip(sites, state):
+    if s == 'original':
+        foff = tra + (rva - tva)
+        data[foff:foff + len(repl)] = repl
+open(path, 'wb').write(bytes(data))
+print('[autodesk-fusion] patch: applied the Qt startup patch to qwindows.dll')
+PYEOF
+}
+
+setup_extras() {
+  if [ -f "$EXTRAS_MARKER" ]; then
+    return 0
+  fi
+  log "Applying the runtime components (.NET, VC runtimes, WebView2, overrides)"
+  local ok=1 attempt
+  for attempt in 1 2; do
+    if ge winetricks -q dotnet20 dotnet48 vcrun2022 fontsmooth=rgb winhttp win10; then
+      ok=1
+      break
+    fi
+    ok=0
+    ge_wait
+  done
+  if [ "$ok" = 0 ]; then
+    log "warning: runtime winetricks did not complete; will retry next launch"
+  fi
+  ge_wait
+  if [ "$ok" = 1 ]; then
+    ge winetricks -q cjkfonts >/dev/null 2>&1 || true
+    ge winetricks -q win11 || log "warning: could not set Windows 11 mode"
+    ge_wait
+  fi
+  # DLL overrides from the community recipe.
+  reg_add 'HKCU\Software\Wine\DllOverrides' 'adpclientservice.exe' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' 'AdCefWebBrowser.exe' 'builtin'
+  reg_add 'HKCU\Software\Wine\DllOverrides' 'msvcp140' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' 'mfc140u' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' 'bcp47langs' ''
+  reg_add 'HKCU\Software\Wine\X11 Driver' 'Managed' 'Y'
+  reg_add 'HKCU\Software\Wine\X11 Driver' 'Decorated' 'Y'
+  # DXVK activation (same overrides winetricks' dxvk verb sets).
+  reg_add 'HKCU\Software\Wine\DllOverrides' '*d3d11' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' '*d3d10core' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' '*dxgi' 'native'
+  reg_add 'HKCU\Software\Wine\DllOverrides' '*d3d9' 'builtin'
+  ge_wait
+  # The identity SDK looks up the identity manager's location in
+  # HKLM\SOFTWARE\Autodesk\AdskIdentityManager; the Fusion streamer
+  # never writes that key, so the SDK logs a lookup failure and uses
+  # a fallback path. Register the copy bundled with Fusion.
+  local mgr rel mgrwin
+  mgr="$(find "$PREFIX/drive_c" -name 'AdskIdentityManager.exe' 2>/dev/null | head -n 1)"
+  if [ -n "$mgr" ]; then
+    rel="${mgr#$PREFIX/drive_c/}"
+    rel="${rel%/AdskIdentityManager.exe}"
+    mgrwin="C:\\${rel//\//\\}"
+    ge wine reg add 'HKLM\SOFTWARE\Autodesk\AdskIdentityManager' /ve /d "$mgrwin" /f >/dev/null 2>&1 || true
+    ge wine reg add 'HKLM\SOFTWARE\Autodesk\AdskIdentityManager' /v Path /d "$mgrwin" /f >/dev/null 2>&1 || true
+    ge_wait
+  fi
+  if [ ! -f "$WEBVIEW2" ]; then
+    log "Downloading the WebView2 runtime from Microsoft"
+    curl -fL -o "$WEBVIEW2" "$WEBVIEW2_URL" || log "warning: WebView2 download failed"
+  fi
+  if [ -f "$WEBVIEW2" ]; then
+    log "Installing the WebView2 runtime"
+    ge wine "$WEBVIEW2" /silent /install || log "warning: WebView2 installer exited nonzero"
+    ge_wait
+  fi
+  if [ "$ok" = 1 ]; then
+    touch "$EXTRAS_MARKER"
+    log "Runtime components complete"
+  fi
+  ge_wait
+}
+
+fix_material_library() {
+  # Fusion launches its material engine (adexmtsv.exe) with a config
+  # from the webdeploy tree's "MaterialLibrary/Material Library"
+  # folder, but the installer under Wine never populates that folder
+  # (the full library lands only in the shared ProgramData tree).
+  # The engine dies instantly on the missing config and Fusion's
+  # startup waits on the engine's pipe forever. Copy the shared
+  # library into the webdeploy folder.
+  local base="$1" dest src
+  dest="$base/MaterialLibrary/Material Library"
+  [ -f "$dest/adexmtsv_prod.cfg" ] && return 0
+  src="$(find "$PREFIX/drive_c/ProgramData/Autodesk/Common/Material Library" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r | head -n 1)"
+  [ -n "$src" ] && [ -f "$src/adexmtsv_prod.cfg" ] || return 0
+  mkdir -p "$dest" || return 0
+  log "Populating Fusion's material library from the shared Autodesk library"
+  cp -a "$src/." "$dest/" || log "warning: material library copy failed"
+}
+
+fix_server_config() {
+  # The bootstrap "Fusion 360.server.config" in the build tree is a
+  # staging config (staging endpoints); the production config ships
+  # in the same tree. Swap it in (the FRR cache seeded below also
+  # overrides it, but the bootstrap is what Fusion reads first).
+  local base="$1" cfg prod
+  cfg="$base/Fusion 360.server.config"
+  prod="$base/Neutron/Server/Base/Options/Application/ApplicationOptions.production.json"
+  [ -f "$cfg" ] && [ -f "$prod" ] || return 0
+  grep -q 'staging' "$cfg" || return 0
+  [ -f "$cfg.staging-bak" ] || cp -f "$cfg" "$cfg.staging-bak" || return 0
+  log "Replacing Fusion's staging server config with the production config"
+  cp -f "$prod" "$cfg" || log "warning: server config swap failed"
+}
+
+fix_identity_manager_config() {
+  # The identity manager's config is signed (edits fail its
+  # signature check) and sets a ~30-second idle quit: started cold
+  # by the launcher, it exits again before Fusion has finished
+  # starting. With the config set aside the manager falls back to
+  # its built-in defaults (same process/server names, 5-minute
+  # idle), which is long enough. The original is kept alongside.
+  local base="$1" cfg
+  cfg="$base/Autodesk Identity Manager/AdskIdentityManager.config"
+  [ -f "$cfg" ] || return 0
+  [ -f "$cfg.orig-bak" ] || cp -f "$cfg" "$cfg.orig-bak" || return 0
+  log "Setting aside the identity manager's signed config so it stays resident"
+  mv -f "$cfg" "$cfg.disabled" || log "warning: could not set aside the identity manager config"
+}
+
+fix_adsso_runtimes() {
+  # The standalone AdSSO install (when present) ships no VC++
+  # runtime, so AdSSO.exe dies instantly with a loader error and
+  # the legacy SSO client waits on it forever. Copy the runtime
+  # app-local from the identity manager's folder.
+  local base="$1" dir dll
+  dir="$PREFIX/drive_c/Program Files/Autodesk/Autodesk AdSSO"
+  [ -f "$dir/AdSSO.exe" ] || return 0
+  [ -f "$dir/msvcp140.dll" ] && return 0
+  for dll in msvcp140.dll vcruntime140.dll vcruntime140_1.dll; do
+    cp -f "$base/Autodesk Identity Manager/$dll" "$dir/" 2>/dev/null || true
+  done
+  [ -f "$dir/msvcp140.dll" ] && log "Supplied the VC++ runtime to the legacy AdSSO component"
+  return 0
+}
+
+seed_fcdr() {
+  # Download one FCDR component set into $1 for client version $2.
+  # fcdr.json is written last: its absence is what makes the caller
+  # retry on the next launch, so a partial seed never sticks.
+  local dest="$1" version="$2" tmp list id ver url out
+  tmp="$(mktemp -d)" || return 1
+  if ! curl -fsSL -o "$tmp/components.json" "https://api.aps.autodesk.com/fcdr/v1/components?clientId=Fremont&clientVersion=$version"; then
+    rm -rf "$tmp"; return 1
+  fi
+  list="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); [print("%s\t%s\t%s" % (c["id"], c["version"], c["artifactZipFileUrl"])) for c in d.get("components",[])]' "$tmp/components.json")" || { rm -rf "$tmp"; return 1; }
+  [ -n "$list" ] || { rm -rf "$tmp"; return 1; }
+  mkdir -p "$dest/fcdr" || { rm -rf "$tmp"; return 1; }
+  while IFS=$'\t' read -r id ver url; do
+    [ -n "$id" ] || continue
+    out="$dest/fcdr/$id/$ver"
+    mkdir -p "$out" || { rm -rf "$tmp"; return 1; }
+    if ! curl -fsSL -o "$tmp/comp.zip" "$url"; then rm -rf "$tmp"; return 1; fi
+    if ! python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$tmp/comp.zip" "$out"; then
+      rm -rf "$tmp"; return 1
+    fi
+  done < <(printf '%s\n' "$list")
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["softwareVersion"]=sys.argv[3]; json.dump(d, open(sys.argv[2],"w"))' "$tmp/components.json" "$dest/fcdr.json" "$version" || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  return 0
+}
+
+fix_fcdr_cache() {
+  # Fusion's own FCDR component download never fires under Wine
+  # (it attempts no outbound connection at all), so without a
+  # seeded cache the region registry falls back to the bootstrap
+  # config. Seed the cache Fusion would have downloaded: the
+  # component list for this build's version, plus a
+  # "softwareVersion" key (the cache loader rejects the bare
+  # server response without it). Every user profile in the prefix
+  # is seeded; which one Proton uses is not fixed.
+  local base="$1" version userdir dest
+  [ -f "$base/fusion_version.txt" ] || return 0
+  version="$(tr -d '[:space:]' < "$base/fusion_version.txt")"
+  [ -n "$version" ] || return 0
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "warning: python3 not available; cannot seed the FCDR component cache"
+    return 0
+  fi
+  for userdir in "$PREFIX/drive_c/users"/*/; do
+    [ -d "$userdir" ] || continue
+    [ "$(basename "$userdir")" = Public ] && continue
+    dest="${userdir}AppData/Roaming/Autodesk/Neutron Platform/fcdr/$version"
+    [ -f "$dest/fcdr.json" ] && continue
+    log "Seeding the FCDR component cache (client version $version)"
+    if ! seed_fcdr "$dest" "$version"; then
+      log "warning: FCDR cache seed failed; will retry next launch"
+    fi
+  done
+  return 0
+}
+
+fix_electron_addins() {
+  # One of the streamer's payload packages - the Electronics one -
+  # can extract incompletely under Wine (an interrupted install is
+  # enough), leaving add-in DLLs such as the ECAD translators out of
+  # the tree. Fusion then opens with a "Problems were detected while
+  # initializing" dialog and its add-in status check fails. The
+  # streamer leaves the downloaded packages in the profile's Temp
+  # folders; if the sentinel translator DLL is missing, find the
+  # package that holds it and fill in whichever of its files are
+  # absent from the production tree. Only packages whose contents
+  # overwhelmingly live at the production root are filled this way
+  # (other packages install to different roots), and the identity
+  # manager's config is never restored - fix_identity_manager_config
+  # disables it on purpose.
+  local base="$1" sentinel pkgs pkg listing total present missing f
+  sentinel="$base/Translators/NaEagleTranslator/NaEagleTranslator10.dll"
+  [ -f "$sentinel" ] && return 0
+  pkgs="$(find "$PREFIX/drive_c/users" -type d -name packages -path '*_payload*' 2>/dev/null)"
+  [ -n "$pkgs" ] || return 0
+  for pkg in $pkgs/*.tar.xz; do
+    [ -f "$pkg" ] || continue
+    listing="$(tar -tJf "$pkg" 2>/dev/null | grep -v '/$')"
+    printf '%s
+' "$listing" | grep -qx 'Translators/NaEagleTranslator/NaEagleTranslator10.dll' || continue
+    total="$(printf '%s
+' "$listing" | wc -l)"
+    present=0; missing=""
+    while IFS= read -r f; do
+      if [ -e "$base/$f" ]; then present=$((present + 1)); else missing="$missing$f
+"; fi
+    done <<EOF2
+$listing
+EOF2
+    [ "$total" -gt 0 ] || continue
+    [ $((present * 100 / total)) -ge 90 ] || continue
+    [ -n "$missing" ] || return 0
+    log "Filling gaps in the Electronics add-ins from the streamer package cache"
+    printf '%s' "$missing" | grep -v '^Autodesk Identity Manager/AdskIdentityManager.config$' > "$DATA/.pkg-missing.txt"
+    tar -xJf "$pkg" -C "$base" -T "$DATA/.pkg-missing.txt" 2>/dev/null || true
+    rm -f "$DATA/.pkg-missing.txt"
+    return 0
+  done
+  return 0
+}
+
+setup_runtime_fixes() {
+  # Repairs for gaps the installer leaves under Wine, each
+  # state-checked and idempotent, all best-effort: the material
+  # library, the production server config, the identity manager's
+  # idle quit, the legacy AdSSO runtime, and the FCDR cache.
+  local exe base
+  exe="$(fusion_exe)"
+  [ -n "$exe" ] || return 0
+  base="$(dirname "$exe")"
+  fix_material_library "$base"
+  fix_server_config "$base"
+  fix_identity_manager_config "$base"
+  fix_adsso_runtimes "$base"
+  fix_fcdr_cache "$base"
+  fix_electron_addins "$base"
+}
+
+start_identity_manager() {
+  # Fusion's identity plugin gives the SSO server only a moment to be
+  # ready. On Windows the identity manager is effectively resident, so
+  # that check passes; under Wine every launch cold-starts it, the
+  # check times out (error 3213) and sign-in never initializes. Start
+  # the manager first and wait until it reports ready, so the plugin
+  # finds a warm server. Best-effort: never delays the launch by more
+  # than about a minute.
+  local mgr idlog base i
+  mgr="$(find "$PREFIX/drive_c" -name 'AdskIdentityManager.exe' 2>/dev/null | head -n 1)"
+  [ -n "$mgr" ] || return 0
+  idlog="$(find "$PREFIX/drive_c/users" -name 'IdServices.log' 2>/dev/null | head -n 1)"
+  base=0
+  [ -n "$idlog" ] && base="$(wc -l < "$idlog")"
+  log "Starting the identity manager ahead of Fusion"
+  wine "$mgr" >/dev/null 2>&1 &
+  if [ -n "$idlog" ]; then
+    for i in $(seq 1 30); do
+      sleep 2
+      if tail -n +"$((base + 1))" "$idlog" 2>/dev/null | grep -q 'SSO Server is ready'; then
+        log "Identity manager is ready"
+        return 0
+      fi
+    done
+    log "Identity manager did not report ready in time; launching anyway"
+  else
+    sleep 10
+  fi
+}
+
+launch() {
+  local exe
+  exe="$(fusion_exe)"
+  [ -n "$exe" ] || die "Fusion360.exe not found in prefix"
+  install_dxvk
+  export WINEDLLOVERRIDES="$BASE_OVERRIDES"
+  # Graphics: with a proprietary NVIDIA driver on the host, the only
+  # GL stack inside the sandbox that can touch the card is Mesa, and
+  # Mesa cannot drive it (the kernel runs NVIDIA's module, not
+  # nouveau); Fusion's main thread then waits forever inside a GL
+  # call during startup and the window never gets past the logo.
+  # Software rendering avoids the device entirely. The embedded
+  # Chromium's sandbox likewise fails under Wine and blanks the
+  # home/sign-in views. Both default on; set either to 0 in the
+  # environment (e.g. via flatpak override) to experiment with real
+  # GPU rendering on other hardware.
+  export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+  export QTWEBENGINE_DISABLE_SANDBOX="${QTWEBENGINE_DISABLE_SANDBOX:-1}"
+  if [ -n "${FUSION_DEBUG:-}" ]; then
+    export WINEDEBUG=-fixme
+  else
+    export WINEDEBUG=-all
+  fi
+  start_identity_manager
+  log "Starting Fusion: $exe"
+  exec wine "$exe" "$@"
+}
+
+handle_idmgr_url() {
+  # adskidmgr:// URLs are the sign-in callback from the browser; hand
+  # them to Autodesk's identity manager inside the prefix.
+  local mgr
+  mgr="$(find "$PREFIX/drive_c" -name 'AdskIdentityManager.exe' 2>/dev/null | head -n 1)"
+  if [ -n "$mgr" ]; then
+    export WINEDLLOVERRIDES="$BASE_OVERRIDES"
+    exec wine "$mgr" "$1"
+  fi
+  log "Received a sign-in callback, but AdskIdentityManager.exe was not found."
+  exit 0
+}
+
+main() {
+  if [[ "${1:-}" == adskidmgr:* ]]; then
+    handle_idmgr_url "$1"
+  fi
+  if [ ! -f "$MARKER" ] || [ -z "$(fusion_exe)" ]; then
+    setup_prefix
+    setup_fusion
+  fi
+  setup_patch
+  setup_extras
+  setup_runtime_fixes
+  launch "$@"
+}
+
+main "$@"

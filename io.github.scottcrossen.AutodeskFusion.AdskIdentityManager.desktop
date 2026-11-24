@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Autodesk Identity Manager
+Comment=Handles adskidmgr:// sign-in callbacks for Autodesk Fusion
+Exec=autodesk-fusion %u
+Icon=io.github.scottcrossen.AutodeskFusion
+Terminal=false
+Type=Application
+NoDisplay=true
+MimeType=x-scheme-handler/adskidmgr;
