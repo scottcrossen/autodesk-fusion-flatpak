@@ -28,9 +28,14 @@
 # leaves under Wine that otherwise stall Fusion's first start:
 # the unpopulated material library its engine loads, the staging
 # server config, the identity manager's signed idle-quit config,
-# the legacy AdSSO component's missing VC++ runtime, and the FCDR
-# component cache Fusion never downloads for itself. Each repair
-# is state-checked, idempotent and best-effort.
+# the legacy AdSSO component's missing VC++ runtime, the FCDR
+# component cache Fusion never downloads for itself, and any files
+# an incompletely extracted streamer package left out of the tree
+# (the Electronics add-ins). Each repair is state-checked,
+# idempotent and best-effort. The launch also defaults to software
+# GL rendering and an unsandboxed embedded Chromium: with a
+# proprietary NVIDIA host driver, GPU GL under Wine hangs Fusion's
+# startup, and the Chromium sandbox blanks its web views.
 #
 # Everything mutable lives under $XDG_DATA_HOME/autodesk-fusion, which
 # for this Flatpak is ~/.var/app/io.github.scottcrossen.AutodeskFusion/data,
@@ -479,6 +484,51 @@ fix_fcdr_cache() {
   return 0
 }
 
+fix_electron_addins() {
+  # One of the streamer's payload packages - the Electronics one -
+  # can extract incompletely under Wine (an interrupted install is
+  # enough), leaving add-in DLLs such as the ECAD translators out of
+  # the tree. Fusion then opens with a "Problems were detected while
+  # initializing" dialog and its add-in status check fails. The
+  # streamer leaves the downloaded packages in the profile's Temp
+  # folders; if the sentinel translator DLL is missing, find the
+  # package that holds it and fill in whichever of its files are
+  # absent from the production tree. Only packages whose contents
+  # overwhelmingly live at the production root are filled this way
+  # (other packages install to different roots), and the identity
+  # manager's config is never restored - fix_identity_manager_config
+  # disables it on purpose.
+  local base="$1" sentinel pkgs pkg listing total present missing f
+  sentinel="$base/Translators/NaEagleTranslator/NaEagleTranslator10.dll"
+  [ -f "$sentinel" ] && return 0
+  pkgs="$(find "$PREFIX/drive_c/users" -type d -name packages -path '*_payload*' 2>/dev/null)"
+  [ -n "$pkgs" ] || return 0
+  for pkg in $pkgs/*.tar.xz; do
+    [ -f "$pkg" ] || continue
+    listing="$(tar -tJf "$pkg" 2>/dev/null | grep -v '/$')"
+    printf '%s
+' "$listing" | grep -qx 'Translators/NaEagleTranslator/NaEagleTranslator10.dll' || continue
+    total="$(printf '%s
+' "$listing" | wc -l)"
+    present=0; missing=""
+    while IFS= read -r f; do
+      if [ -e "$base/$f" ]; then present=$((present + 1)); else missing="$missing$f
+"; fi
+    done <<EOF2
+$listing
+EOF2
+    [ "$total" -gt 0 ] || continue
+    [ $((present * 100 / total)) -ge 90 ] || continue
+    [ -n "$missing" ] || return 0
+    log "Filling gaps in the Electronics add-ins from the streamer package cache"
+    printf '%s' "$missing" | grep -v '^Autodesk Identity Manager/AdskIdentityManager.config$' > "$DATA/.pkg-missing.txt"
+    tar -xJf "$pkg" -C "$base" -T "$DATA/.pkg-missing.txt" 2>/dev/null || true
+    rm -f "$DATA/.pkg-missing.txt"
+    return 0
+  done
+  return 0
+}
+
 setup_runtime_fixes() {
   # Repairs for gaps the installer leaves under Wine, each
   # state-checked and idempotent, all best-effort: the material
@@ -493,6 +543,7 @@ setup_runtime_fixes() {
   fix_identity_manager_config "$base"
   fix_adsso_runtimes "$base"
   fix_fcdr_cache "$base"
+  fix_electron_addins "$base"
 }
 
 start_identity_manager() {
@@ -531,6 +582,18 @@ launch() {
   [ -n "$exe" ] || die "Fusion360.exe not found in prefix"
   install_dxvk
   export WINEDLLOVERRIDES="$BASE_OVERRIDES"
+  # Graphics: with a proprietary NVIDIA driver on the host, the only
+  # GL stack inside the sandbox that can touch the card is Mesa, and
+  # Mesa cannot drive it (the kernel runs NVIDIA's module, not
+  # nouveau); Fusion's main thread then waits forever inside a GL
+  # call during startup and the window never gets past the logo.
+  # Software rendering avoids the device entirely. The embedded
+  # Chromium's sandbox likewise fails under Wine and blanks the
+  # home/sign-in views. Both default on; set either to 0 in the
+  # environment (e.g. via flatpak override) to experiment with real
+  # GPU rendering on other hardware.
+  export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}"
+  export QTWEBENGINE_DISABLE_SANDBOX="${QTWEBENGINE_DISABLE_SANDBOX:-1}"
   if [ -n "${FUSION_DEBUG:-}" ]; then
     export WINEDEBUG=-fixme
   else
@@ -555,7 +618,7 @@ handle_idmgr_url() {
 }
 
 main() {
-  if [[ "${1:-}" == adskidmgr://* ]]; then
+  if [[ "${1:-}" == adskidmgr:* ]]; then
     handle_idmgr_url "$1"
   fi
   if [ ! -f "$MARKER" ] || [ -z "$(fusion_exe)" ]; then
